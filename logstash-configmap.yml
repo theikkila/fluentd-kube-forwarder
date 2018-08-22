@@ -1,0 +1,141 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: logging-configmap
+  namespace: kube-system
+  labels:
+    k8s-app: logging
+data:
+  logstash.yml: |
+    http.host: "0.0.0.0"
+    path.config: /usr/share/logstash/pipeline
+    ## Disable X-Pack
+    ## see https://www.elastic.co/guide/en/x-pack/current/xpack-settings.html
+    xpack.monitoring.enabled: false
+  logstash.conf: |
+    # Start of logstash
+
+    input {
+      http {
+        port => 4000
+        codec => "json_lines"
+      }
+    }
+
+    filter {
+
+      # Drop events with wrong ingest path
+      # Only /_bulk is allowed
+      if [headers][request_path] != '/_bulk' { drop {} }
+      # Drop events without 'tag'-field
+      # Prevents other than Fluentd-events because all of them got this
+      if ![tag] { drop {} }
+
+      # Remove http-headers and redundant fluenttag
+      mutate {
+        remove_field => [ "fluenttag", "headers" ]
+      }
+
+      # Tag all fluentd events starting with specialteam as specialteam
+      # These are sent straight from JAVA-applications using
+      # fluentd-client
+      if [tag] =~ /^specialteam/ {
+        mutate {
+          add_tag => [ "specialteam", "eventlog" ]
+        }
+      }
+
+
+      # Container STDOUTs
+      # The same you can see with
+      # kubectl logs ...
+      if [tag] =~ /^kubernetes.var.log.containers/ {
+        mutate {
+          add_tag => [ "container-log" ]
+          strip => [ "log" ]
+        }
+        # Try to parse some known formats
+        grok {
+          match => {"log" => "\A%{TIMESTAMP_ISO8601:origts} %{LOGLEVEL:loglevel} %{GREEDYDATA:message}"}
+        }
+      }
+
+      # Calico is an overlay network for kubernetes
+      # This tags it with 'networking' and parses loglevel
+      if [kubernetes][container_name] == "calico-node" {
+        grok {
+          match => {
+            "log" => "\A%{TIMESTAMP_ISO8601:origts} \[%{LOGLEVEL:loglevel}]\[%{PROG}] %{GREEDYDATA:message}"
+          }
+          add_tag => [ "networking" ]
+        }
+      }
+
+      # This parses fluentd own logs from DaemonSet
+      if [kubernetes][container_name] == "fluentd" {
+        grok {
+          match => {
+            "log" => "\A%{TOMCAT_DATESTAMP:origts} \[%{LOGLEVEL:loglevel}]: %{SYSLOGPROG} \[%{JAVAMETHOD:component}] %{GREEDYDATA:message}"
+          }
+          add_tag => [ "logging" ]
+        }
+      }
+
+      # If container name is nginx try to parse it like nginx access logs
+      if [kubernetes][container_name] == "nginx" {
+        grok {
+          match => {
+            "log" => "\A%{IPORHOST:[nginx][clientip]} (?:-|(%{WORD}.%{WORD})) %{USER:[nginx][ident]} \[%{HTTPDATE:[nginx][timestamp]}\] \"(?:%{WORD:[nginx][http_verb]} %{NOTSPACE:[nginx][request]}(?: HTTP/%{NUMBER:[nginx][httpversion]})?|%{DATA:[nginx][rawrequest]})\" %{NUMBER:[nginx][response]} (?:%{NUMBER:[nginx][bytes]}|-) %{QS:[nginx][referrer]} %{QS:[nginx][agent]} %{QS:[nginx][forwarder]}"
+          }
+          add_tag => [ "nginx" ]
+        }
+      }
+
+      # Mark everything from kube-system as admin
+      if [kubernetes][namespace_name] == "kube-system" {
+        mutate {
+          add_tag => [ "admin" ]
+        }
+      }
+
+      # Mark everything from specialteam as specialteam
+      if [kubernetes][namespace_name] == "specialteam" {
+        mutate {
+          add_tag => [ "specialteam" ]
+        }
+      }
+
+
+      # If specialteam in tags, mark it confidential
+      if "specialteam" in [tags] {
+        mutate {
+          add_tag => [ "confidential" ]
+        }
+      }
+
+
+    }
+
+
+    output {
+
+      # Output all non-confidential lines for admins
+      #if "confidential" not in [tags] {
+      #   elasticsearch {
+      #       hosts => [ "admin-elasticsearch:9200" ]
+      #   }
+      #}
+
+      # Output all specialteam tagged lines for the team
+      #if "specialteam" in [tags] {
+      #  file {
+      #     path => "specialteam.json"
+      #     codec => json_lines
+      #   }
+      #}
+
+      file {
+        path => "all.json"
+        codec => json_lines
+      }
+    }
